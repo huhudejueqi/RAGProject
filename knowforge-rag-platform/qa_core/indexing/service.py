@@ -27,6 +27,7 @@ from qa_core.indexing.manifest import IndexManifest
 from qa_core.retrieval.factory import get_doc_store
 from qa_core.scenarios.registry import resolve_scenario
 from qa_core.utils import file_fingerprint, normalize_source_from_path
+from qa_core.knowledge_graph.pipeline import run_knowledge_graph_pipeline
 
 
 logger = get_logger(__name__)
@@ -298,6 +299,7 @@ def _rebuild_file_chunks(
     existing,
     settings,
     *,
+    _chunk_collector: list | None = None,
     expired_chunks: int = 0,
 ) -> FileIngestResult:
     """重新加载、标准化、切分并写入一个已变化或新增的文件。
@@ -327,11 +329,13 @@ def _rebuild_file_chunks(
         valid_from_seq=context.kb_version_seq,
         file_path=str(path.resolve()),
     )
+    if _chunk_collector is not None:
+        _chunk_collector.extend(chunks)
     _record_manifest(context, path, fingerprint, ids, settings)
     return FileIngestResult(reembedded_chunks=len(chunks), expired_chunks=expired_chunks)
 
 
-def _ingest_single_file(path: Path, context: DocumentIngestContext) -> FileIngestResult:
+def _ingest_single_file(path: Path, context: DocumentIngestContext, *, _chunk_collector: list | None = None) -> FileIngestResult:
     """处理单个文件的增量入库。
 
     这个函数是 `ingest_directory()` 的最小执行单元。之所以拆出来，是因为“目录遍历”
@@ -371,7 +375,7 @@ def _ingest_single_file(path: Path, context: DocumentIngestContext) -> FileInges
         expired_chunks = _expire_base_record_for_target(context, base_record)
 
     # 文件已变更或 schema 升级，清理旧 chunk 后重新入库，防止向量数据版本混乱
-    return _rebuild_file_chunks(context, path, fingerprint, existing, settings, expired_chunks=expired_chunks)
+    return _rebuild_file_chunks(context, path, fingerprint, existing, settings, expired_chunks=expired_chunks, _chunk_collector=_chunk_collector)
 
 
 def _expire_missing_base_records(context: DocumentIngestContext, seen_paths: set[str]) -> int:
@@ -478,9 +482,10 @@ def ingest_directory(
     )
     stats = DirectoryIngestStats()
     seen_paths: set[str] = set()
+    _all_chunks: list = []  # 收集新建 chunk 用于知识图谱构建
     for path in _walk_files(root):
         seen_paths.add(str(path.resolve()))
-        stats.add(_ingest_single_file(path, context))
+        stats.add(_ingest_single_file(path, context, _chunk_collector=_all_chunks))
     stats.expired_chunks += _expire_missing_base_records(context, seen_paths)
     # 在版本清单中记录本次入库统计
     version_store.record_ingest_result(
@@ -500,6 +505,24 @@ def ingest_directory(
         stats.skipped_files,
         active_kb_version,
     )
+    # ── 知识图谱构建（异步触发） ──
+    if _all_chunks:
+        try:
+            import asyncio
+            kg_result = asyncio.run(run_knowledge_graph_pipeline(
+                _all_chunks,
+                kb_version=active_kb_version,
+            ))
+            logger.info(
+                "知识图谱构建完成: %d 实体, %d 关系, %d 社群",
+                kg_result.entities_extracted,
+                kg_result.relationships_extracted,
+                kg_result.communities_detected,
+            )
+            if kg_result.errors:
+                logger.warning("知识图谱构建部分失败: %s", kg_result.errors)
+        except Exception as e:
+            logger.warning("知识图谱构建异常: %s", e)
     return stats.total_chunks
 
 

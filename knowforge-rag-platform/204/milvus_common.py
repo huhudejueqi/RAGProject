@@ -163,8 +163,12 @@ def connect_client() -> MilvusClient:
         if MILVUS_DB not in client.list_databases():
             # 不存在则创建（Milvus Database 是逻辑隔离单元，类似 MySQL 的 CREATE DATABASE）
             client.create_database(MILVUS_DB)
-        # 切换到演示 Database（类似 USE database）
-        client.using_database(MILVUS_DB)
+        # 切换到演示 Database（类似 USE database）。
+        # PyMilvus 2.6+ 将 using_database 标记为弃用，优先使用新 API。
+        if hasattr(client, "use_database"):
+            client.use_database(MILVUS_DB)
+        else:
+            client.using_database(MILVUS_DB)
     return client
 
 # ============================================================================
@@ -210,6 +214,54 @@ def create_base_schema(client: MilvusClient):
     return schema
 
 
+def _describe_collection_fields(client: MilvusClient, collection_name: str) -> dict[str, dict]:
+    """把 describe_collection 返回的 fields 列表整理成按字段名索引的字典。"""
+    detail = client.describe_collection(collection_name=collection_name)
+    return {field["name"]: field for field in detail.get("fields", [])}
+
+
+def _collection_row_count(client: MilvusClient, collection_name: str) -> int:
+    """读取 Collection 当前已有的数据行数。"""
+    stats = client.get_collection_stats(collection_name=collection_name)
+    return int(stats.get("row_count", 0))
+
+
+def _base_collection_schema_mismatch(client: MilvusClient, collection_name: str) -> list[str]:
+    """检查当前 Collection 是否和本项目的基础 Schema 兼容。"""
+    fields = _describe_collection_fields(client, collection_name)
+    mismatches: list[str] = []
+
+    required_fields = {
+        "pk": DataType.VARCHAR,
+        "text": DataType.VARCHAR,
+        "dense": DataType.FLOAT_VECTOR,
+        "source": DataType.VARCHAR,
+        "kb_version": DataType.VARCHAR,
+    }
+
+    for field_name, expected_type in required_fields.items():
+        field = fields.get(field_name)
+        if field is None:
+            mismatches.append(f"缺少字段 {field_name!r}")
+            continue
+        if field.get("type") != expected_type:
+            mismatches.append(
+                f"字段 {field_name!r} 类型不一致：当前 {field.get('type')}，期望 {expected_type}"
+            )
+
+    pk_field = fields.get("pk")
+    if pk_field and not pk_field.get("is_primary", False):
+        mismatches.append("字段 'pk' 不是主键")
+
+    dense_field = fields.get("dense")
+    if dense_field:
+        current_dim = dense_field.get("params", {}).get("dim")
+        if str(current_dim) != str(DIM):
+            mismatches.append(f"字段 'dense' 维度不一致：当前 {current_dim}，期望 {DIM}")
+
+    return mismatches
+
+
 # ============================================================================
 # 六、Collection 重建工具
 # ============================================================================
@@ -237,10 +289,26 @@ def recreate_base_collection(
     if drop_old and client.has_collection(collection_name):
         client.drop_collection(collection_name)
 
-    # 幂等：已存在则复用
     if client.has_collection(collection_name):
-        print(f"Collection already exists: {collection_name}")
-        return
+        mismatches = _base_collection_schema_mismatch(client, collection_name)
+        if not mismatches:
+            print(f"Collection already exists: {collection_name}")
+            return
+
+        row_count = _collection_row_count(client, collection_name)
+        mismatch_text = "; ".join(mismatches)
+        if row_count == 0:
+            print(
+                f"Collection schema is outdated but empty: {collection_name}。"
+                f"发现问题：{mismatch_text}。正在自动重建。"
+            )
+            client.drop_collection(collection_name)
+        else:
+            raise RuntimeError(
+                f"Collection {collection_name!r} 的 Schema 与当前代码不兼容，且已有 {row_count} 条数据。"
+                f"发现问题：{mismatch_text}。"
+                "请先备份数据，再手动 drop/recreate，或指定 drop_old=True。"
+            )
 
     # 创建 Schema
     schema = create_base_schema(client)
@@ -248,7 +316,7 @@ def recreate_base_collection(
     # consistency_level="Session"：会话一致性，保证本客户端写入后立即可查
     #   （比 Strong 快，比 Eventually 可靠，适合单机教学场景）
     client.create_collection(
-        collection_name=    ,
+        collection_name=collection_name,
         schema=schema,
         consistency_level="Session",
     )
@@ -278,25 +346,68 @@ def create_hnsw_index(client: MilvusClient, collection_name: str = BASE_COLLECTI
       1. 检查索引是否已存在（幂等）
       2. 创建 IndexParams → 添加 HNSW 索引配置 → 调用 create_index
     """
-    # 幂等：已存在则跳过
+    field_name = "dense"
+    index_name = "dense_hnsw"
+    index_type = "HNSW"
+    metric_type = "COSINE"
+    index_params_values = {"M": 16, "efConstruction": 100}
+
+    # 幂等判断必须按字段做，而不是只按索引名做。
+    # Milvus 不允许同一个字段同时存在多个索引；如果 dense 字段已有名为 dense 的索引，
+    # 再创建 dense_hnsw 也会失败。
     index_names = client.list_indexes(collection_name=collection_name)
-    if "dense_hnsw" in index_names:
-        print("Index already exists: dense_hnsw")
-        return
+    # 获取到表中的行的数据数量
+    row_count = _collection_row_count(client, collection_name)
+    for existing_index_name in index_names:
+        # 根据表（集合）名和索引的名字获取到索引的详细信息
+        detail = client.describe_index(
+            collection_name=collection_name,
+            index_name=existing_index_name,
+        )
+        # 索引关联的列的名字，如果这个列添加过索引，则跳过
+        if detail.get("field_name") != field_name:
+            continue
+
+        same_index = (
+            detail.get("index_type") == index_type
+            and detail.get("metric_type") == metric_type
+            and str(detail.get("M")) == str(index_params_values["M"])
+            and str(detail.get("efConstruction")) == str(index_params_values["efConstruction"])
+        )
+        if same_index:
+            print(f"Index already exists on field '{field_name}': {existing_index_name}")
+            return
+
+        if row_count == 0:
+            print(
+                f"Collection is empty, dropping incompatible index '{existing_index_name}' "
+                f"on field '{field_name}' and recreating."
+            )
+            client.drop_index(collection_name=collection_name, index_name=existing_index_name)
+            break
+
+        raise RuntimeError(
+            f"字段 '{field_name}' 已存在索引 '{existing_index_name}'，"
+            f"配置为 index_type={detail.get('index_type')}, "
+            f"metric_type={detail.get('metric_type')}, "
+            f"M={detail.get('M')}, efConstruction={detail.get('efConstruction')}。"
+            "Milvus 不支持同一个字段同时创建多个索引；如需更换索引配置，"
+            "请先删除旧索引或重建 Collection。"
+        )
 
     # 准备索引参数容器
     index_params = client.prepare_index_params()
     # 为 dense 字段添加 HNSW 索引
     index_params.add_index(
-        field_name="dense",           # 对哪个向量字段建索引
-        index_name="dense_hnsw",      # 索引名称（用于后续管理）
-        index_type="HNSW",            # 索引类型：分层可导航小世界图
-        metric_type="COSINE",         # 相似度度量：余弦相似度
-        params={"M": 16, "efConstruction": 100},  # HNSW 构建参数
+        field_name=field_name,        # 对哪个向量字段建索引
+        index_name=index_name,        # 索引名称（用于后续管理）
+        index_type=index_type,        # 索引类型：分层可导航小世界图
+        metric_type=metric_type,      # 相似度度量：余弦相似度
+        params=index_params_values,   # HNSW 构建参数
     )
     # 调用 create_index，Milvus 后台异步构建索引
     client.create_index(collection_name=collection_name, index_params=index_params)
-    print("Created vector index: dense_hnsw")
+    print(f"Created vector index: {index_name}")
 
 
 # ============================================================================
