@@ -27,6 +27,9 @@ from qa_core.pipeline.context import (
 from qa_core.pipeline.query_variants import generate_query_variants
 from qa_core.pipeline.rewrite import rewrite_query_if_needed
 from qa_core.pipeline.runtime import RAGQueryContext
+from qa_core.knowledge_graph.retrieval_integration import format_graph_context
+from qa_core.config.logging_config import get_logger
+logger = get_logger(__name__)
 from qa_core.prompts.profiles import PromptProfile
 from qa_core.prompts.selector import build_answer_prompt_profile
 from qa_core.retrieval.factory import get_faq_store
@@ -506,10 +509,21 @@ def prepare_answer(
     )
 
     # 将历史消息转为中文对话文本，填充到提示词模板中
+    base_context = build_context(context_docs) or "无可用上下文。必须明确回答：信息不足，无法确认。"
+
+    # ── 知识图谱上下文增强 ──
+    kg_text = format_graph_context(prepared.rewritten_query)
+    enhanced_context = base_context + ("\n" + kg_text if kg_text else "")
+
+    # 知识图谱有匹配时：仅标记 hit_type，上下文已追加到 enhanced_context 中
+    if kg_text:
+        hit_type = "graph_context"
+        logger.info("prepare_answer: KG injected, hit_type=%s query=%s", hit_type, prepared.rewritten_query)
+
     user_prompt = prepared.prompt_profile.user_template.format(
         history=format_messages(prepared.history_messages),
         question=prepared.rewritten_query,
-        context=build_context(context_docs) or "无可用上下文。必须明确回答：信息不足，无法确认。",
+        context=enhanced_context,
     )
     return AnswerPreparation(
         context_docs=context_docs,

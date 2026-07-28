@@ -23,7 +23,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import uvicorn
-from qa_core.api import admin, chat, kb_versions, pages
+from qa_core.api import admin, chat, graph, kb_versions, pages
 from qa_core.api.error_handlers import register_api_exception_handlers
 from qa_core.config.logging_config import get_logger
 from qa_core.config.preflight import validate_active_kb_versions, validate_runtime_environment
@@ -93,6 +93,43 @@ app.include_router(pages.router)
 app.include_router(chat.router)
 app.include_router(admin.router)
 app.include_router(kb_versions.router)
+app.include_router(graph.router)
 
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("app:app", host="0.0.0.0", port=18000, reload=False)
+
+# ── Demo: 简单的 HTTP 问答接口（用于对比测试） ──
+from fastapi import Query as QueryParam
+from qa_core.api.service_context import QueryServiceContext
+from qa_core.application.factory import get_qa_service
+
+@app.get("/api/qa")
+async def simple_qa(
+    q: str = QueryParam(..., description="问题"),
+    use_kg: bool = QueryParam(True, description="是否使用知识图谱"),
+):
+    """接受 GET 请求返回 RAG 回答（同步，逐 token 拼接）。"""
+    # 临时开关 KG
+    from qa_core.knowledge_graph import retrieval_integration as kg_mod
+    _original_fn = kg_mod.format_graph_context
+
+    if not use_kg:
+        kg_mod.format_graph_context = lambda query, **kw: ""
+    try:
+        service = get_qa_service()
+        context = QueryServiceContext.from_query(q, scenario_id="enterprise_knowledge")
+
+        answer = ""
+        for event in service.stream_query(*context.service_args()):
+            if event.get("type") == "token":
+                answer += event.get("data", "")
+            elif event.get("type") == "end":
+                answer += event.get("data", "")
+                break
+            elif event.get("type") == "error":
+                answer = f"[错误] {event.get('data', '')}"
+                break
+        return {"query": q, "answer": answer, "use_kg": use_kg}
+    finally:
+        if not use_kg:
+            kg_mod.format_graph_context = _original_fn

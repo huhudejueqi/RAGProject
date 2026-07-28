@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>知识图谱 · KnowForge</title>
+<script src="https://unpkg.com/vis-network@9.1.6/dist/vis-network.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#1a1a2e;color:#e0e0e0;overflow:hidden}
+.header{display:flex;align-items:center;gap:12px;padding:8px 16px;background:#16213e;border-bottom:1px solid #0f3460;height:48px}
+.header h1{font-size:15px;font-weight:600;color:#e94560}
+.search-box{flex:1;max-width:360px;position:relative}
+.search-box input{width:100%;padding:6px 10px;border:1px solid #0f3460;border-radius:6px;font-size:13px;outline:none;background:#0f3460;color:#e0e0e0}
+.search-box input::placeholder{color:#666}
+.search-box input:focus{border-color:#e94560}
+.stats{font-size:12px;color:#888;white-space:nowrap}
+#graph-container{width:100%;height:calc(100vh - 48px);background:#1a1a2e}
+.legend{position:fixed;right:16px;top:56px;background:rgba(22,33,62,0.94);border:1px solid #0f3460;border-radius:8px;padding:10px 14px;font-size:12px;max-height:340px;overflow-y:auto;z-index:10;min-width:130px}
+.legend-title{font-weight:600;font-size:13px;margin-bottom:6px;color:#e94560}
+.legend-item{display:flex;align-items:center;gap:6px;padding:2px 0;cursor:pointer;user-select:none;color:#ccc}
+.legend-item:hover{color:#fff}
+.legend-item.filtered{opacity:0.25}
+.legend-dot{width:10px;height:10px;border-radius:50%;display:inline-block;flex-shrink:0;border:1px solid rgba(255,255,255,0.1)}
+.legend-count{margin-left:auto;color:#666;font-size:11px}
+.tooltip{position:fixed;background:rgba(0,0,0,0.88);color:#e0e0e0;padding:8px 12px;border-radius:6px;font-size:12px;line-height:1.5;max-width:340px;pointer-events:none;display:none;z-index:100;word-break:break-all;border:1px solid #333}
+.reset-btn{padding:4px 10px;border:1px solid #0f3460;border-radius:4px;background:transparent;cursor:pointer;font-size:12px;white-space:nowrap;color:#aaa}
+.reset-btn:hover{background:#0f3460;color:#fff}
+.nav-btns{display:flex;gap:4px}
+.nav-btns button{padding:4px 8px;border:1px solid #0f3460;border-radius:4px;background:transparent;cursor:pointer;font-size:11px;color:#888}
+.nav-btns button:hover{background:#0f3460;color:#fff}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>🐈 KnowForge</h1>
+  <div class="search-box">
+    <input id="searchInput" placeholder="搜索实体..." onkeydown="if(event.key==='Enter') searchGraph()">
+  </div>
+  <div class="nav-btns">
+    <button onclick="fitView()">⊞ 适配</button>
+    <button onclick="resetView()">↺ 重置</button>
+  </div>
+  <div class="stats" id="stats">就绪</div>
+</div>
+
+<div id="graph-container"></div>
+<div class="legend" id="legend"><div class="legend-title">类型过滤</div><div style="color:#666;font-size:11px">加载中...</div></div>
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+let network = null;
+let allNodes = new vis.DataSet([]);
+let allEdges = new vis.DataSet([]);
+let filteredTypes = new Set();
+let currentQuery = '萧炎';
+
+const TYPE_COLORS = {
+  '人物':'#3498db','组织':'#e74c3c','地点':'#2ecc71',
+  '事件':'#f39c12','概念':'#9b59b6','项目':'#1abc9c',
+  '产品':'#e67e22','文档':'#34495e','药品':'#27ae60',
+  '疾病':'#c0392b','症状':'#e67e22',
+  '斗技':'#e67e22','功法':'#8e44ad','异火':'#e74c3c',
+  'OTHER':'#95a5a6',
+};
+
+function searchGraph() {
+  const q = document.getElementById('searchInput').value.trim() || '萧炎';
+  currentQuery = q;
+  loadGraph(q);
+}
+
+async function loadGraph(query) {
+  document.getElementById('stats').textContent = '查询中...';
+  try {
+    const resp = await fetch('/api/graph/query?q=' + encodeURIComponent(query) + '&top_k=15');
+    const data = await resp.json();
+    if (data.error) { document.getElementById('stats').textContent = '错误: ' + data.error; return; }
+
+    const nodes = data.nodes || [];
+    const edges = data.edges || [];
+
+    // ── 层级计算（按 degree 分 4 层） ──
+    const degMap = {};
+    for (const e of edges) {
+      degMap[e.from] = (degMap[e.from] || 0) + 1;
+      degMap[e.to] = (degMap[e.to] || 0) + 1;
+    }
+    const maxDeg = Math.max(...Object.values(degMap), 1);
+
+    // 分档：核心(>=70%) / 重要(40-70%) / 次要(15-40%) / 叶子(<15%)
+    const tiers = nodes.map(n => {
+      const deg = degMap[n.id] || 0;
+      const ratio = deg / maxDeg;
+      let tier = 0;
+      if (ratio >= 0.7) tier = 4;       // 核心
+      else if (ratio >= 0.4) tier = 3;  // 重要
+      else if (ratio >= 0.15) tier = 2; // 次要
+      else tier = 1;                     // 叶子
+      return { id: n.id, deg, ratio, tier, group: n.group || 'OTHER', color: n.color || '#95a5a6', size: n.size || 15, title: n.title || n.id };
+    });
+    const tierMap = Object.fromEntries(tiers.map(t => [t.id, t]));
+
+    // ── vis.js 节点 ──
+    const visNodes = tiers.map(t => {
+      const isLeaf = t.tier === 1;
+      const isCore = t.tier === 4;
+      return {
+        id: t.id,
+        label: t.id,
+        title: t.title,
+        group: t.group,
+        color: { background: t.color, border: isCore ? '#fff' : t.color, highlight: { background: t.color, border: '#e94560' } },
+        size: Math.max(6, Math.min(45, 6 + t.ratio * 39)),
+        font: {
+          size: isLeaf ? 6 : Math.max(9, Math.min(18, 9 + t.ratio * 9)),
+          face: 'Arial, sans-serif',
+          color: isCore ? '#fff' : '#ccc',
+          strokeWidth: isCore ? 3 : 1,
+          strokeColor: '#1a1a2e',
+        },
+        borderWidth: isCore ? 3 : (t.tier >= 3 ? 2 : 1),
+        shape: 'dot',
+        opacity: isLeaf ? 0.5 : 1.0,
+        margin: 4,
+      };
+    });
+
+    // ── vis.js 连边（去重 + 曲线） ──
+    const edgeKeySet = new Set();
+    const dedupEdges = [];
+    for (const e of edges) {
+      const key = e.from < e.to ? e.from+'→'+e.to : e.to+'→'+e.from;
+      if (!edgeKeySet.has(key)) { edgeKeySet.add(key); dedupEdges.push(e); }
+    }
+
+    const visEdges = dedupEdges.map((e, i) => {
+      const strength = e.value || 1;
+      const fromTier = tierMap[e.from]?.tier || 1;
+      const toTier = tierMap[e.to]?.tier || 1;
+      const avgTier = (fromTier + toTier) / 2;
+      // 核心节点边更粗更亮，叶子节点边半透明
+      const edgeOpacity = Math.max(0.15, Math.min(0.8, avgTier / 4));
+      const edgeWidth = Math.max(0.3, Math.min(4, avgTier));
+      // 边标签：短直接显示，长文本摘要
+      const rawLabel = (e.label || e.title || '').trim();
+      const edgeLabel = rawLabel.length <= 8 ? rawLabel : rawLabel.slice(0, 6) + '…';
+      return {
+        id: 'e'+i,
+        from: e.from, to: e.to,
+        label: edgeLabel,
+        title: (e.title || e.label || ''),
+        value: strength,
+        width: edgeWidth,
+        color: { color: `rgba(150,150,180,${edgeOpacity})`, hover: '#e94560' },
+        smooth: { type: 'curvedCW', roundness: 0.15 },
+        arrows: { to: { enabled: avgTier >= 2.5, scaleFactor: 0.3 } },
+        font: { size: 8, strokeWidth: 1, strokeColor: '#1a1a2e', color: '#aaa', align: 'middle' },
+      };
+    });
+
+    allNodes = new vis.DataSet(visNodes);
+    allEdges = new vis.DataSet(visEdges);
+
+    // ── 物理引擎：力导向布局 ──
+    const options = {
+      nodes: {
+        shape: 'dot',
+        font: { face: 'Arial, sans-serif' },
+        borderWidth: 1,
+        shadow: { enabled: true, size: 4, color: 'rgba(0,0,0,0.3)' },
+      },
+      edges: {
+        smooth: { type: 'curvedCW', roundness: 0.15 },
+        font: { size: 8, color: '#aaa', strokeWidth: 1, strokeColor: '#1a1a2e', align: 'middle' },
+      },
+      physics: {
+        solver: 'forceAtlas2Based',
+        forceAtlas2Based: {
+          gravitationalConstant: -40,
+          centralGravity: 0.005,
+          springLength: 250,
+          springConstant: 0.02,
+          damping: 0.5,
+          avoidOverlap: 0.8,
+        },
+        stabilization: { iterations: 300, updateInterval: 25 },
+        adaptiveTimestep: true,
+      },
+      interaction: {
+        hover: true, tooltipDelay: 100,
+        navigationButtons: true, keyboard: true,
+        dragNodes: true, dragView: true, zoomView: true,
+        hoverConnectedEdges: true,
+      },
+    };
+
+    const container = document.getElementById('graph-container');
+    if (network) network.destroy();
+    network = new vis.Network(container, { nodes: allNodes, edges: allEdges }, options);
+
+    // 悬浮提示
+    network.on('hoverNode', function(params) {
+      const node = allNodes.get(params.node);
+      if (node) {
+        const tooltip = document.getElementById('tooltip');
+        tooltip.textContent = node.title || node.label || params.node;
+        tooltip.style.display = 'block';
+        tooltip.style.left = Math.min(params.event.clientX + 14, window.innerWidth - 350) + 'px';
+        tooltip.style.top = Math.min(params.event.clientY - 10, window.innerHeight - 80) + 'px';
+      }
+    });
+    network.on('blurNode', function() {
+      document.getElementById('tooltip').style.display = 'none';
+    });
+
+    // 悬浮边也显示 label
+    network.on('hoverEdge', function(params) {
+      const edge = allEdges.get(params.edge);
+      if (edge && edge.title) {
+        const tooltip = document.getElementById('tooltip');
+        tooltip.textContent = edge.title;
+        tooltip.style.display = 'block';
+        tooltip.style.left = Math.min(params.event.clientX + 14, window.innerWidth - 350) + 'px';
+        tooltip.style.top = Math.min(params.event.clientY - 10, window.innerHeight - 80) + 'px';
+      }
+    });
+    network.on('blurEdge', function() {
+      document.getElementById('tooltip').style.display = 'none';
+    });
+
+    // ── 统计 ──
+    const typeCount = {};
+    for (const n of nodes) {
+      const g = n.group || 'OTHER';
+      typeCount[g] = (typeCount[g] || 0) + 1;
+    }
+    document.getElementById('stats').textContent =
+      nodes.length + ' 节点 · ' + dedupEdges.length + ' 关系 · ' + query;
+
+    // ── 图例 ──
+    const types = [...new Set(nodes.map(n => n.group || 'OTHER'))].sort();
+    let legendHtml = '<div class="legend-title">类型过滤</div>';
+    for (const t of types) {
+      const c = TYPE_COLORS[t] || '#95a5a6';
+      const count = typeCount[t] || 0;
+      const cls = filteredTypes.has(t) ? 'legend-item filtered' : 'legend-item';
+      legendHtml += '<div class="' + cls + '" data-type="' + t + '" onclick="toggleType(\'' + t + '\')">' +
+        '<span class="legend-dot" style="background:' + c + '"></span>' +
+        t + '<span class="legend-count">' + count + '</span></div>';
+    }
+    document.getElementById('legend').innerHTML = legendHtml;
+
+  } catch(e) {
+    document.getElementById('stats').textContent = '失败: ' + e.message;
+  }
+}
+
+function toggleType(type) {
+  if (filteredTypes.has(type)) filteredTypes.delete(type);
+  else filteredTypes.add(type);
+  applyFilter();
+}
+
+function applyFilter() {
+  allNodes.forEach(n => {
+    allNodes.update({ id: n.id, hidden: filteredTypes.has(n.group) });
+  });
+  const visible = allNodes.get().filter(n => !n.hidden);
+  const visibleIds = new Set(visible.map(n => n.id));
+  let visibleEdgeCount = 0;
+  allEdges.forEach(e => {
+    const hide = !visibleIds.has(e.from) || !visibleIds.has(e.to);
+    allEdges.update({ id: e.id, hidden: hide });
+    if (!hide) visibleEdgeCount++;
+  });
+  document.querySelectorAll('.legend-item').forEach(el => {
+    const t = el.dataset.type;
+    el.className = 'legend-item' + (filteredTypes.has(t) ? ' filtered' : '');
+  });
+  document.getElementById('stats').textContent =
+    visible.length + ' 节点 · ' + visibleEdgeCount + ' 关系 · 过滤 ' + filteredTypes.size + ' 类型';
+}
+
+function fitView() {
+  if (network) network.fit({ animation: { duration: 300, easingFunction: 'easeInOutQuad' } });
+}
+
+function resetView() {
+  filteredTypes.clear();
+  allNodes.forEach(n => allNodes.update({ id: n.id, hidden: false }));
+  allEdges.forEach(e => allEdges.update({ id: e.id, hidden: false }));
+  document.querySelectorAll('.legend-item').forEach(el => el.className = 'legend-item');
+  if (network) {
+    network.setOptions({ physics: { enabled: true } });
+    setTimeout(() => network.fit({ animation: { duration: 300 } }), 100);
+  }
+  document.getElementById('searchInput').value = currentQuery;
+}
+
+// ── 默认加载 ──
+loadGraph('萧炎');
+</script>
+</body>
+</html>

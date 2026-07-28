@@ -28,9 +28,10 @@ ENTITY_RELATION_EXTRACT_PROMPT = """### 角色
    - 对每对相关实体提取以下信息：
      - **source_entity**：源实体名称，与步骤 1 一致。
      - **target_entity**：目标实体名称，与步骤 1 一致。
-     - **relationship_description**：解释为何认为两实体相关。
+     - **relationship_label**：关系标签，**2~6 个字的短摘要**，如"老师""父亲""同盟""所在地""敌对""同门"等。
+     - **relationship_description**：关系详细描述，解释为何认为两实体相关。
      - **relationship_strength**：关系的强度评分（数值 1-10）。
-   - 格式化每个关系为：`("relationship"{tuple_delimiter}<source_entity>{tuple_delimiter}<target_entity>{tuple_delimiter}<relationship_description>{tuple_delimiter}<relationship_strength>)`。
+   - 格式化每个关系为：`("relationship"{tuple_delimiter}<source_entity>{tuple_delimiter}<target_entity>{tuple_delimiter}<relationship_label>{tuple_delimiter}<relationship_description>{tuple_delimiter}<relationship_strength>)`。
 
 3. **输出格式**：
    - 以中文返回单一列表，包含步骤 1 和 2 识别的所有实体和关系。
@@ -57,7 +58,7 @@ ENTITY_RELATION_EXTRACT_PROMPT = """### 角色
 {record_delimiter}
 ("entity"{tuple_delimiter}MARKET STRATEGY COMMITTEE{tuple_delimiter}ORGANIZATION{tuple_delimiter}Central Institution 的委员会，负责利率和货币供应增长的关键决策)
 {record_delimiter}
-("relationship"{tuple_delimiter}MARTIN SMITH{tuple_delimiter}CENTRAL INSTITUTION{tuple_delimiter}Martin Smith 是 Central Institution 的主席，将在新闻发布会上答问{tuple_delimiter}9)
+("relationship"{tuple_delimiter}MARTIN SMITH{tuple_delimiter}CENTRAL INSTITUTION{tuple_delimiter}主席{tuple_delimiter}Martin Smith 是 Central Institution 的主席，将在新闻发布会上答问{tuple_delimiter}9)
 {completion_delimiter}
 ```
 

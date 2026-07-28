@@ -14,6 +14,7 @@ import networkx as nx
 
 from qa_core.config.logging_config import get_logger
 from qa_core.knowledge_graph.extractor import ExtractedEntity, ExtractedRelation
+from qa_core.knowledge_graph.extractor import _auto_label_from_desc
 
 logger = get_logger(__name__)
 
@@ -83,6 +84,7 @@ class KnowledgeGraphBuilder:
                 G.add_edge(
                     r.source,
                     r.target,
+                    label=r.label if r.label else _auto_label_from_desc(r.description),
                     description=r.description,
                     weight=r.strength,
                 )

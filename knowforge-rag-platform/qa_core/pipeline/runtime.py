@@ -308,8 +308,10 @@ def create_query_context(
     # 步骤1：根据 scenario_id 解析当前请求的业务场景配置（含场景数据目录、FAQ 路径等）
     scenario = resolve_scenario(scenario_id)
     raw_query = query.strip()
+    logger.info("[create_context] scenario=%s raw_query=%.80s", scenario.scenario_id, raw_query)
     # 步骤2：归一化用户查询——去短句化、追问改写，得到用于检索和意图识别的业务有效问题
     effective_query = normalize_user_query(raw_query)
+    logger.info("[create_context] normalized: %.80s -> %.80s", raw_query, effective_query)
     # 步骤3：构建数据域隔离信息（租户、数据集、可见级别、角色），用于 Milvus 检索过滤
     data_scope = resolve_data_scope(
         tenant_id=tenant_id,

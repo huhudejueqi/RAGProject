@@ -41,7 +41,8 @@ class ExtractedRelation:
     """从文本中抽取的关系。"""
     source: str
     target: str
-    description: str
+    label: str = ""         # 短标签，2~6字
+    description: str = ""   # 完整描述
     strength: float = 1.0
     source_doc_id: str = ""
     source_chunk_id: str = ""
@@ -142,7 +143,25 @@ class GraphExtractor:
                         type=etype.upper(),
                         description=desc,
                     ))
+            elif record_type == "relationship" and len(parts) >= 6:
+                source = parts[1].strip('"\'')
+                target = parts[2].strip('"\'')
+                label = parts[3].strip('"\'')
+                desc = parts[4].strip('"\'')
+                try:
+                    strength = float(parts[5].strip('"\''))
+                except (ValueError, IndexError):
+                    strength = 1.0
+                if source and target:
+                    relationships.append(ExtractedRelation(
+                        source=source.upper(),
+                        target=target.upper(),
+                        label=label,
+                        description=desc,
+                        strength=min(strength, 10.0),
+                    ))
             elif record_type == "relationship" and len(parts) >= 5:
+                # 旧格式兼容（无 label），从描述自动推断短标签
                 source = parts[1].strip('"\'')
                 target = parts[2].strip('"\'')
                 desc = parts[3].strip('"\'')
@@ -151,9 +170,11 @@ class GraphExtractor:
                 except (ValueError, IndexError):
                     strength = 1.0
                 if source and target:
+                    label = _auto_label_from_desc(desc)
                     relationships.append(ExtractedRelation(
                         source=source.upper(),
                         target=target.upper(),
+                        label=label,
                         description=desc,
                         strength=min(strength, 10.0),
                     ))
@@ -248,3 +269,90 @@ class GraphExtractor:
             entities=list(seen_entities.values()),
             relationships=unique_rels,
         )
+
+def _auto_label_from_desc(desc: str) -> str:
+    """从关系描述中自动推断短标签（2~6字）。"""
+    import re
+    desc = desc.strip()
+    if not desc:
+        return "关联"
+    
+    # ── 规则1: "X是Y的Z"（如"天蚕土豆是《斗破苍穹》的作者" → 作者）──
+    m = re.search(r'是.+的(.{2,8})(?:[，。！？、；：]|$)', desc)
+    if m:
+        rel = re.sub(r'[，。！？、；：""''（）【】《》\s]', '', m.group(1))
+        ignore = {'帮助','进行','获得','需要','一个','一种','一些','这个'}
+        if 2 <= len(rel) <= 6 and rel not in ignore:
+            return rel
+    
+    # ── 规则2: 主体之后的第一个动词/介词短语 ──
+    # 去掉主体前缀后的前几字
+    after = re.sub(r'^(?:萧炎|药老|萧战|纳兰|萧薰|萧媚|萧宁|雅妃|加列|云岚|萧家|熏儿|墨管家|三位长老|神秘老者|古戒|戒指|婚约|黑色)', '', desc[:20])
+    # "与…" → 关系
+    if after.startswith('与'):
+        m = re.search(r'与(.{2,12}?)(?:关系|之间|，|的)', after)
+        if m:
+            rel = m.group(1)
+            if 2 <= len(rel) <= 4:
+                return rel
+        return "关系"
+    # "是…" → "是"后面的
+    if after.startswith('是'):
+        after2 = after[1:]
+        # 跳过"萧家成员"中的"萧家"
+        after2 = re.sub(r'^(?:萧家|云岚|米特尔|加列|魔兽|斗气|炼药|纳兰|迦南)', '', after2)
+        m = re.search(r'^(.{2,8})(?:[，。！？、；：]|$)', after2)
+        if m:
+            rel = m.group(1)
+            if 2 <= len(rel) <= 4:
+                return rel
+    # "在…" → 所在地/位置
+    if after.startswith('在'):
+        return "所在地"
+    # "向…" → 请教/学习
+    if after.startswith(('向', '从', '对', '给')):
+        m = re.search(r'[向从对给](.{2,6})', after)
+        if m:
+            rel = m.group(1).replace(',', '').replace('，', '')
+            if 2 <= len(rel) <= 4:
+                return rel
+        return "关系"
+    # "修炼"/"学习" → 保留
+    for kw in ['修炼', '学习', '炼药', '炼制', '研究']:
+        if kw in after[:10]:
+            return kw
+    # "计划"/"前往" → 计划
+    for kw in ['计划', '前往', '约定', '前往']:
+        if kw in after[:10]:
+            return kw
+    
+    # ── 规则3: 已知关系词匹配 ──
+    known = {
+        '敌对':['敌对','冲突','对抗','打压','竞争'],
+        '合作':['合作','联手','合伙'],
+        '交易':['拍卖','购买','售卖','交易'],
+        '家族':['家族','族员','族人','成员'],
+        '好友':['好友','朋友','伙伴','亲密'],
+        '父子':['父亲','儿子','父子','父女'],
+        '师徒':['师傅','老师','教导','传授','指导','徒弟','弟子'],
+    }
+    for label, keywords in known.items():
+        for kw in keywords:
+            if kw in desc[:30]:
+                return label
+    
+    # ── 规则4: 从句子结构提取关键名词 ──
+    # "参加成年仪式" → "成年仪式"
+    m = re.search(r'(?:参加|举行|举办|召开)(.{2,8})(?:[，。！？]|$)', desc)
+    if m:
+        rel = re.sub(r'[，。！？、；：""''（）【】《》\s]', '', m.group(1))
+        if 2 <= len(rel) <= 5:
+            return rel
+    # "测试出…" → 提取结果
+    m = re.search(r'测试出(.{2,8})(?:[，。！？]|$)', desc)
+    if m:
+        rel = re.sub(r'[，。！？、；：""''（）【】《》\s]', '', m.group(1))
+        if 2 <= len(rel) <= 5:
+            return rel
+    
+    return desc[:3]

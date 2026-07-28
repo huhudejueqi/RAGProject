@@ -241,10 +241,13 @@ def warmup_retrieval_stack() -> dict[str, object]:
     active_versions: dict[str, str] = {}
     # 遍历所有场景逐一预热，保证任意场景的第一个用户请求零冷启动延迟
     for scenario in registry.list_scenarios():
-        # 解析每个场景的 active 知识库版本，若缺失则启动时直接暴露
-        active_versions[scenario.scenario_id] = resolve_active_kb_version(None, scenario.scenario_id)
+        try:
+            ver = resolve_active_kb_version(None, scenario.scenario_id)
+            active_versions[scenario.scenario_id] = ver
+        except (ValueError, RuntimeError):
+            logger.warning("scenario %s no active version, skip warmup", scenario.scenario_id)
+            continue
         for collection_name in (scenario.faq_collection, scenario.doc_collection):
-            # 触发 Milvus 集合的懒加载连接，提前初始化 collection
             _ = get_hybrid_store(collection_name).store
             warmed_collections.append(collection_name)
 

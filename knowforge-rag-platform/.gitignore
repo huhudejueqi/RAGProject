@@ -40,3 +40,12 @@ Thumbs.db
 *.tmp
 *.bak
 repro_*.py
+
+# 开发过程中的中间/测试产物
+demo_*.py
+data_packs/
+wh05_*/
+storage.py.bak
+
+# 运行时生成的图谱缓存
+kg_*.json
