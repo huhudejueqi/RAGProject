@@ -16,10 +16,13 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from qa_core.config.logging_config import get_logger
 from qa_core.config.rules import RetrievalStrategyRules, get_rule_config
 from qa_core.config.settings import get_settings
 from qa_core.intent.classifier import IntentResult
 from qa_core.intent.question_category import infer_question_category, is_table_query
+
+logger = get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -101,6 +104,20 @@ class PlanPatch:
 
 def _intent_rules(settings) -> dict[str, PlanPatch]:
     """返回意图到检索参数补丁的映射。
+
+    三种意图的检索策略对比：
+    ┌────────────────┬─────────┬─────────┬──────────┬──────────┐
+    │ 意图           │ faq_top │ doc_top │ 上下文数  │ 直出阈值  │
+    ├────────────────┼─────────┼─────────┼──────────┼──────────┤
+    │ FAQ_QUERY      │ 默认    │ 减半     │ 默认     │ 降低     │
+    │                │         │ (降噪)  │          │ (易直出)  │
+    ├────────────────┼─────────┼─────────┼──────────┼──────────┤
+    │ KNOWLEDGE_QUERY│ 默认     │ 增加    │ 扩大     │ 默认     │
+    │                │         │ (多证据) │         │          │
+    ├────────────────┼─────────┼─────────┼──────────┼──────────┤
+    │ FOLLOW_UP      │ 扩大    │ 增加     │ 扩大     │ 提高     │
+    │                │         │         │          │ (保守)   │
+    └────────────────┴─────────┴─────────┴──────────┴──────────┘
 
     调用顺序：检索准备或检索执行 -> _intent_rules()。
     """
@@ -263,13 +280,29 @@ def _apply_plan_rules(
 ) -> PlanParams:
     """按固定顺序应用意图、短问题、决策分数、类别和表格规则。
 
+    5 层规则依次叠加，后层可能覆盖前层：
+      ① 意图分支 — FAQ/知识/追问各自调整召回量和阈值
+      ② 短问题保护 — 短句歧义大，限制召回、提高FAQ直出门槛
+      ③ 规则分数保护 — 规则分越低，检索越保守
+      ④ 风险类别 — 费用/合规提高阈值，排障扩大召回
+      ⑤ 表格偏好 — 扩大文档候选、禁用模糊FAQ直出
+
     调用顺序：检索准备或检索执行 -> _apply_plan_rules()。
     """
     rules = get_rule_config().retrieval_strategy
+    logger.info("╭── _apply_plan_rules ── intent=%s  confidence=%.2f  is_short=%s  category=%s  table=%s",
+        intent.intent, intent.confidence, is_short, question_category, prefer_table)
+    logger.info("│ 初始 params: faq_top_k=%s  doc_top_k=%s  threshold=%s  context_top_n=%s  exact_only=%s  reason=%s",
+        params.get("faq_top_k"), params.get("doc_top_k"), params.get("direct_threshold"),
+        params.get("final_context_top_n"), params.get("faq_direct_exact_only"), params.get("reason"))
+
     intent_patch = _intent_rules(settings).get(intent.intent)
     if intent_patch:
+        logger.info("│ ① 意图分支: intent=%s  patch_reason=%s", intent.intent, intent_patch.reason)
         _apply_patch(params, intent_patch)
     if is_short and intent.intent != "FOLLOW_UP":
+        logger.info("│ ② 短问题保护: doc_top_k_max=%d  threshold_min=%.2f",
+            max(12, settings.final_context_top_n * 2), rules.short_query_guard_threshold)
         _apply_patch(
             params,
             PlanPatch(
@@ -280,11 +313,15 @@ def _apply_plan_rules(
         )
     score_guard = _rule_score_guard(settings, rules, intent.confidence)
     if score_guard:
+        logger.info("│ ③ 规则分保护: confidence=%.2f  patch_reason=%s", intent.confidence, score_guard.reason)
         _apply_patch(params, score_guard)
     category_patch = _category_rules(settings).get(question_category)
     if category_patch:
+        logger.info("│ ④ 风险类别: category=%s  patch_reason=%s", question_category, category_patch.reason)
         _apply_patch(params, category_patch)
     if prefer_table and params["run_doc"]:
+        logger.info("│ ⑤ 表格偏好: doc_top_k_min=%d  context_top_n_min=%d  exact_only=True",
+            settings.doc_complex_query_top_k, rules.table_context_top_n_min)
         _apply_patch(
             params,
             PlanPatch(
@@ -294,6 +331,10 @@ def _apply_plan_rules(
                 faq_direct_exact_only=True,
             ),
         )
+    logger.info("│ 最终 params: faq_top_k=%s  doc_top_k=%s  threshold=%s  context_top_n=%s  exact_only=%s  reason=%s",
+        params.get("faq_top_k"), params.get("doc_top_k"), params.get("direct_threshold"),
+        params.get("final_context_top_n"), params.get("faq_direct_exact_only"), params.get("reason"))
+    logger.info("╰── %s", "─" * 55)
     return params
 
 

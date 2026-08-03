@@ -32,11 +32,14 @@ def generate_query_variants(query: str, *, enabled: bool, allow_short_structured
     # 加载应用全局设置（retrieval_variant_max 等检索配置）
     settings = get_settings()
     cleaned = query.strip()
-    # 功能禁用或无可变体空间时仅用原问题检索，避免无关变体稀释召回精度
+    # --- 场景 1：功能关闭或无可变体空间 → 只返回原问题 ---
+    # enabled=False（build_retrieval_plan 指定不启用）或 retrieval_variant_max ≤ 0（配置设为 0）时跳过。
     if not enabled or not cleaned or settings.retrieval_variant_max <= 0:
         return [cleaned]
 
-    # 普通短结构化问题保持克制；已追问改写的问题仍允许规则变体，避免上下文锚点丢失同义召回机会。
+    # --- 场景 2：短结构化问题（≤24 字 + 命中 marker）→ 不扩展 ---
+    # 这种问题本身已是标准业务表述（如"入职需要哪些材料"），同义改写收益极低。
+    # 追问例外："那审批呢"太短，不加 LLM 扩展就没有任何同义表达。
     if (
         _looks_like_short_structured_question(cleaned)
         and not allow_short_structured
@@ -44,28 +47,40 @@ def generate_query_variants(query: str, *, enabled: bool, allow_short_structured
     ):
         return [cleaned]
 
-    # 第一层：先用确定性本地规则（零成本）为高频业务术语生成同义变体
-    # 规则生成足够变体时直接返回，跳过第二层 LLM 调用，兼顾延迟与成本
+    # --- 场景 3：规则同义替换（零成本，不走 LLM）---
+    # 从 rules.toml 里读取高频替换对，如 "流程"↔"SOP"。
+    # 规则命中至少一个变体就返回，不再调 LLM。
     heuristic_variants = _heuristic_variants(cleaned, settings.retrieval_variant_max)
     if len(heuristic_variants) > 1:
         return heuristic_variants
 
     variants = [cleaned]
-    # 第二层：规则未覆盖的新领域词或罕见表达回退 LLM 扩展，避免召回覆盖率因规则缺失而下降
-    model = get_chat_model(streaming=False).with_structured_output(QueryVariants)
-    # 调用 LLM 生成等价检索表达（如同义词、不同说法），不改变用户问题含义
-    result = model.invoke(
-        [
-            SystemMessage(content=QUERY_VARIANT_SYSTEM_PROMPT),
-            HumanMessage(content=f"原问题：{cleaned}\n最多生成 {settings.retrieval_variant_max} 条检索表达。"),
-        ]
-    )
-    for item in result.queries:
-        candidate = item.strip()
-        if candidate and candidate not in variants:
-            variants.append(candidate)
-        if len(variants) >= settings.retrieval_variant_max + 1:
-            break
+    # --- 场景 4：规则未覆盖 → LLM 扩展（兜底）---
+    # 规则替换没命中（如"头疼"不在替换表里），回退到 LLM 生成同义变体。
+    # 用纯文本 prompt + 手动 JSON 解析，兼容不支持 response_format 的模型。
+    model = get_chat_model(streaming=False)
+    try:
+        result = model.invoke(
+            [
+                SystemMessage(content=QUERY_VARIANT_SYSTEM_PROMPT),
+                HumanMessage(content=f"原问题：{cleaned}\n最多生成 {settings.retrieval_variant_max} 条检索表达。\n请只返回 JSON 数组，不要其他内容。"),
+            ]
+        )
+        import json
+        raw = result.content.strip()
+        # 处理模型可能用 ```json ... ``` 包裹的情况
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("\n", 1)[0] if "\n" in raw else raw[3:-3]
+        parsed = json.loads(raw)
+        queries = parsed if isinstance(parsed, list) else parsed.get("queries", [])
+        for item in queries:
+            candidate = str(item).strip()
+            if candidate and candidate not in variants:
+                variants.append(candidate)
+            if len(variants) >= settings.retrieval_variant_max + 1:
+                break
+    except Exception:
+        logger.warning("LLM 检索变体生成失败，仅使用原问题检索: %s", cleaned)
     return variants
 
 
@@ -119,4 +134,3 @@ def _replace_term(query: str, old: str, new: str, rule: QueryVariantReplacementR
     if not rule.ignore_case:
         return query.replace(old, new)
     return re.sub(re.escape(old), new, query, flags=re.IGNORECASE)
-

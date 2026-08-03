@@ -17,6 +17,12 @@ def _scenario_prompt_context(scenario: ScenarioDefinition) -> dict[str, str]:
 
     返回：
         包含 assistant_name、business_domain、industry、support_contact、phone 的字典。
+        各字段含义：
+        - assistant_name：当前场景 AI 助手身份名称，用于 {assistant_name}。
+        - business_domain：当前场景负责的业务范围，用于 {business_domain}。
+        - industry：当前场景所属行业，用于 {industry}。
+        - support_contact：人工支持团队或联系人，用于 {support_contact}。
+        - phone：联系方式；当前复用 support_contact 的值，暂无独立场景字段或 {phone} 占位符。
 
     调用顺序：回答准备阶段 -> _scenario_prompt_context()。
     """

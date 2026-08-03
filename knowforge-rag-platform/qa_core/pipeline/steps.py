@@ -107,9 +107,19 @@ def should_try_faq_fast_path(query: str, scenario) -> bool:
     """
     rules = get_rule_config().faq_fast_path
     compact_query = query.strip()
-    if not compact_query or len(compact_query) > rules.max_chars or "\n" in compact_query:
+    if not compact_query:
+        logger.info("│   faq_fast_path: False (空查询)")
         return False
-    return bool(rules.hint_matches(compact_query) or infer_source(compact_query, scenario))
+    if len(compact_query) > rules.max_chars:
+        logger.info("│   faq_fast_path: False (超长 %d > %d)", len(compact_query), rules.max_chars)
+        return False
+    if "\n" in compact_query:
+        logger.info("│   faq_fast_path: False (含换行)")
+        return False
+    hint_ok = bool(rules.hint_matches(compact_query))
+    source_ok = bool(infer_source(compact_query, scenario))
+    logger.info("│   faq_fast_path: hint=%s source=%s -> %s", hint_ok, source_ok, hint_ok or source_ok)
+    return hint_ok or source_ok
 
 
 def _exact_faq_answer(query: str, faq_result: RetrievalResult) -> tuple[str | None, RetrievalResult]:
@@ -188,6 +198,7 @@ def try_fast_faq_direct_answer(context: RAGQueryContext) -> tuple[str | None, In
     """
     # 根据问题关键词推断可能的业务分类过滤项
     suggested_source = infer_source(context.query, context.scenario)
+    logger.info("│   try_fast_faq: query=%s  suggested_source=%s", context.query, suggested_source)
     intent = IntentResult(
         intent="FAQ_QUERY",
         rule_score=0.98,
@@ -237,7 +248,9 @@ def try_fast_faq_direct_answer(context: RAGQueryContext) -> tuple[str | None, In
     )
 
     def run_fast_faq_search() -> RetrievalResult:
+        # 第 1 步：查缓存。同样的检索参数之前搜过，直接返回，跳过 Milvus 查询
         cached = cache.get_retrieval_result(cache_key, source_type="faq")
+        # 第 2 步：记缓存事件（命中/未命中），供 trace 和诊断面板用
         context.record_cache_event(
             stage="faq_fast_retrieval",
             enabled=cache.enabled,
@@ -245,27 +258,34 @@ def try_fast_faq_direct_answer(context: RAGQueryContext) -> tuple[str | None, In
             source_type="faq",
             key=cache_key,
         )
+        # 第 3 步：缓存命中 → 直接返回旧结果，不走 Milvus
         if cached is not None:
             return cached
+        # 第 4 步：缓存未命中 → 调 Milvus 做混合检索（dense + sparse, WeightedRanker, 不重排）
         result = get_faq_store(context.scenario.faq_collection).search_many(
             [context.query],
             k=fast_faq_top_k,
-            source_filter=effective_source_filter,
-            kb_version=context.active_kb_version,
-            data_scope=context.data_scope,
+            source_filter=effective_source_filter,   # 只搜指定业务分类（如 it/hr/finance）
+            kb_version=context.active_kb_version,     # 只搜当前生效的知识库版本
+            data_scope=context.data_scope,            # 租户/数据域隔离
             scenario_id=context.scenario.scenario_id,
             source_type="faq",
-            rerank=False,
+            rerank=False,                             # fast path 不启用 CrossEncoder 重排
         )
+        # 第 5 步：把结果写进缓存，下次同参数查询直接复用
         cache.set_retrieval_result(cache_key, result, source_type="faq")
         return result
 
     faq_result = context.run_stage("faq_fast_retrieval", run_fast_faq_search)
     context.retrieval_info["faq_elapsed_ms"] = round(faq_result.elapsed_ms, 2)
     context.retrieval_info["faq_top_score"] = faq_result.top_score
+    logger.info("│   faq_retrieval: hits=%d  top_score=%.4f  elapsed=%s",
+        len(faq_result.hits), faq_result.top_score or 0, faq_result.elapsed_ms)
 
     # 从 FAQ 候选中找与用户问题标准问题完全一致的答案，只允许精确匹配直出
     answer, faq_result = _exact_faq_answer(context.query, faq_result)
+    logger.info("│   faq_exact_match: %s (top_score=%.4f)",
+        "found" if answer else "not_found", faq_result.top_score or 0)
     if not answer:
         # 缓存 fast path 的 FAQ 召回结果，主链路同参数时复用避免重复检索
         context.fast_faq_result = faq_result
@@ -300,15 +320,23 @@ def decide_route(context: RAGQueryContext) -> RouteDecision:
 
     调用顺序：QAService/RAG 管线 -> decide_route()。
     """
+    logger.info("╭── decide_route ── query=%s  source_filter=%s  scenario=%s", context.query, context.source_filter, context.scenario.scenario_id)
     context.run_stage(
         "validate_source",
-        lambda: validate_source_filter(context.source_filter, context.scenario.valid_sources),
+        lambda: (
+            logger.info("│ validate_source: filter=%s  valid_sources=%s", context.source_filter, context.scenario.valid_sources),
+            validate_source_filter(context.source_filter, context.scenario.valid_sources),
+        )[1],
     )
 
     direct_intent = context.run_stage(
         "route_direct_intent",
-        lambda: classify_direct_intent(context.query, context.scenario),
+        lambda: (
+            logger.info("│ classify_direct_intent: query=%s  scenario=%s", context.query, context.scenario.scenario_id),
+            classify_direct_intent(context.query, context.scenario),
+        )[1],
     )
+    logger.info("│ direct_intent=%s (answer=%s, reason=%s)", direct_intent.intent if direct_intent else None, (direct_intent.direct_answer[:80] + "...") if direct_intent and direct_intent.direct_answer else None, direct_intent.reason if direct_intent else None)
     if direct_intent:
         _apply_direct_route(context, direct_intent, route="direct_answer", reason=direct_intent.reason)
         return RouteDecision(
@@ -319,6 +347,9 @@ def decide_route(context: RAGQueryContext) -> RouteDecision:
         )
 
     boundary_answer = detect_and_apply_boundary_answer(context)
+    logger.info("│ boundary_answer=%s (reason=%s)",
+        (boundary_answer[:80] + '...') if boundary_answer else None,
+        context.retrieval_info.get("boundary_reason"))
     if boundary_answer:
         intent = IntentResult(
             intent="OUT_OF_SCOPE",
@@ -332,7 +363,9 @@ def decide_route(context: RAGQueryContext) -> RouteDecision:
         return RouteDecision(route="direct_answer", answer=boundary_answer, intent=intent, reason=intent.reason)
 
     if should_try_faq_fast_path(context.query, context.scenario):
+        logger.info("│ should_try_faq_fast_path=True")
         answer, intent = try_fast_faq_direct_answer(context)
+        logger.info("│ faq_exact result=%s", "found" if answer else "not_found")
         if answer:
             context.hit_type = "faq_direct"
             context.retrieval_info["route"] = "faq_exact"
@@ -340,6 +373,7 @@ def decide_route(context: RAGQueryContext) -> RouteDecision:
             return RouteDecision(route="faq_exact", answer=answer, intent=intent, reason="faq_exact_match")
 
     context.retrieval_info["route"] = "retrieval"
+    logger.info("╰── route=retrieval (所有低成本路径均未命中)")
     context.retrieval_info["route_reason"] = "no_deterministic_route"
     return RouteDecision(route="retrieval", reason="no_deterministic_route")
 
