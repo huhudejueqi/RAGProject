@@ -7,20 +7,36 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import tiktoken
 from langchain_core.documents import Document
 
 from qa_core.config.logging_config import get_logger
 from qa_core.config.settings import get_settings
 from qa_core.knowledge_graph.extractor import GraphExtractor, ExtractedEntity, ExtractedRelation
+from qa_core.knowledge_graph.community_search import CommunitySummarizer
 from qa_core.knowledge_graph.graph_builder import KnowledgeGraphBuilder
 from qa_core.knowledge_graph.storage import GraphStorage, EMBEDDING_DIM
 
 logger = get_logger(__name__)
 
+GRAPHRAG_BATCH_TOKEN_SIZE = 4096
+_GRAPHRAG_TOKEN_ENCODING = "cl100k_base"
+
 
 @dataclass
 class KGIngestResult:
-    """单次图谱构建的统计结果。"""
+    """单次知识图谱构建的统计与错误结果。
+
+    由 run_knowledge_graph_pipeline() 返回，用于调用方判断本次构建是否正常完成，
+    并查看抽取、图构建、社群检测和 Milvus 写入各阶段的结果。
+
+    字段语义：
+    - total_chunks 是输入 Document 总数，未去重；processed_chunks 是去重后实际参与抽取的 parent 数量。
+    - entities_extracted / relationships_extracted 是别名合并前的 LLM 抽取数量；合并后的图规模以 stored 和社区结果为准。
+    - stored 只在图构建成功并写入 Milvus 后才有值；抽取为空或图构建失败时保持空 dict。
+    - success 只表示没有记录到 errors，不等于一定产生了可用图谱：可能成功返回但实体/关系为空。
+    - errors 可能来自抽取、图构建或存储阶段；调用方应检查其内容决定是否告警或回滚。
+    """
     total_chunks: int = 0
     processed_chunks: int = 0
     entities_extracted: int = 0
@@ -31,10 +47,103 @@ class KGIngestResult:
 
     @property
     def success(self) -> bool:
+        """是否没有任何记录到的错误；注意不代表本次构建一定产生了可用图谱。"""
         return len(self.errors) == 0
 
 
+@dataclass
+class _GraphExtractionBatch:
+    """按 parent_content 顺序累计后的一次抽取批次。"""
 
+    text: str
+    chunks: list[Document]
+    source_chunk_ids: list[str]
+
+
+def _num_tokens(text: str) -> int:
+    """按 cl100k_base 估算文本 token 数，和 GraphRAG 默认分批口径一致。"""
+    return len(tiktoken.get_encoding(_GRAPHRAG_TOKEN_ENCODING).encode(text))
+
+
+def _graph_text_for_chunk(chunk: Document) -> str:
+    """优先使用 parent_content；测试/无父子元数据时回退到 page_content。"""
+    metadata = getattr(chunk, "metadata", None) or {}
+    parent_content = metadata.get("parent_content")
+    if parent_content and str(parent_content).strip():
+        return str(parent_content).strip()
+    page_content = getattr(chunk, "page_content", "")
+    return str(page_content or "").strip()
+
+
+def _graph_source_key(chunk: Document, text: str) -> tuple[object, ...]:
+    """生成图谱抽取去重键：优先 parent_id，其次 chunk_id，最后按文档与文本兜底。"""
+    metadata = getattr(chunk, "metadata", None) or {}
+    if metadata.get("parent_id"):
+        return ("parent_id", str(metadata["parent_id"]))
+    if metadata.get("chunk_id"):
+        return ("chunk_id", str(metadata["chunk_id"]))
+    return ("doc", str(metadata.get("doc_id", "")), text)
+
+
+def _build_graph_batches(
+    chunks: list[Document],
+    max_tokens: int = GRAPHRAG_BATCH_TOKEN_SIZE,
+) -> list[_GraphExtractionBatch]:
+    """把 parent_content 去重并按原始顺序累计到 token 上限。
+
+    同一 parent_id 的多个 child chunk 只抽取一次；单个 parent 超过上限时
+    仍作为一个 batch 交给抽取，避免再次切割 parent_content。
+    """
+    seen: set[tuple[object, ...]] = set()
+    unique_parents: list[Document] = []
+    for chunk in chunks:
+        text = _graph_text_for_chunk(chunk)
+        if not text:
+            continue
+        key = _graph_source_key(chunk, text)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_parents.append(chunk)
+
+    batches: list[_GraphExtractionBatch] = []
+    current_chunks: list[Document] = []
+    current_text = ""
+    current_tokens = 0
+
+    def flush() -> None:
+        nonlocal current_chunks, current_text, current_tokens
+        if not current_chunks:
+            return
+        batches.append(_GraphExtractionBatch(
+            text=current_text,
+            chunks=list(current_chunks),
+            source_chunk_ids=[
+                str((getattr(chunk, "metadata", None) or {}).get("chunk_id") or "")
+                for chunk in current_chunks
+            ],
+        ))
+        current_chunks = []
+        current_text = ""
+        current_tokens = 0
+
+    for chunk in unique_parents:
+        text = _graph_text_for_chunk(chunk)
+        separator = "\n\n" if current_text else ""
+        candidate_text = f"{current_text}{separator}{text}"
+        candidate_tokens = _num_tokens(candidate_text)
+
+        if current_chunks and candidate_tokens > max_tokens:
+            flush()
+            candidate_text = text
+            candidate_tokens = _num_tokens(candidate_text)
+
+        current_text = candidate_text
+        current_tokens = candidate_tokens
+        current_chunks.append(chunk)
+
+    flush()
+    return batches
 
 
 def _resolve_entity_aliases(
@@ -203,28 +312,32 @@ async def run_knowledge_graph_pipeline(
     chunks: list[Document],
     kb_version: str = "",
     collection_prefix: str = "",
-    batch_size: int = 10,
+    max_tokens: int = GRAPHRAG_BATCH_TOKEN_SIZE,
     max_gleanings: int = 1,
     enable_community_detection: bool = True,
+    generate_community_summaries: bool = True,
 ) -> KGIngestResult:
     """从文档块中执行完整的知识图谱构建管线。
 
     流程：
-        1. 对每个 chunk 执行 LLM 实体/关系抽取
-        2. 构建 NetworkX 图
-        3. （可选）社群检测
-        4. 结果存入 Milvus
+        1. 按 parent_content 去重并按文档顺序累计到 token 上限
+        2. 每个 batch 调用一次 LLM 实体/关系抽取
+        3. 构建 NetworkX 图
+        4. （可选）社群检测
+        5. （可选）为社群生成摘要，失败不阻塞图入库
+        6. 结果存入 Milvus
 
     参数：
         chunks: 文档块列表（来自索引管线的输出）
         kb_version: 当前知识库版本号
         collection_prefix: 集合名称前缀
-        batch_size: 每批处理的 chunk 数
+        max_tokens: 每个抽取 batch 的文本 token 上限
         max_gleanings: 每轮抽取的迭代补充次数
         enable_community_detection: 是否执行社群检测
+        generate_community_summaries: 是否生成社区摘要，默认开启；测试或成本敏感场景可关闭
 
     返回：
-        KGIngestResult: 构建统计信息
+        KGIngestResult: 构建统计与错误结果，字段语义见 KGIngestResult 类注释。
     """
     if not chunks:
         logger.warning("无可处理的文档块")
@@ -236,6 +349,7 @@ async def run_knowledge_graph_pipeline(
     extractor = GraphExtractor(max_gleanings=max_gleanings)
     builder = KnowledgeGraphBuilder()
     storage = GraphStorage(collection_name_prefix=collection_prefix)
+    summarizer = CommunitySummarizer()
 
     # 确保集合已创建
     try:
@@ -244,32 +358,34 @@ async def run_knowledge_graph_pipeline(
     except Exception as e:
         logger.warning("创建 Milvus 集合失败（可能无 Milvus 服务）: %s", e)
 
-    # 分批抽取
+    # 按 parent_content 分批抽取
+    graph_batches = _build_graph_batches(chunks, max_tokens=max_tokens)
+    if not graph_batches:
+        logger.info("没有足够长的 parent_content，跳过知识图谱构建")
+        return result
+
     all_entities = []
     all_relationships = []
 
-    for i in range(0, len(chunks), batch_size):
-        batch = chunks[i:i + batch_size]
-        for chunk in batch:
-            chunk_text = chunk.page_content if hasattr(chunk, "page_content") else str(chunk)
-            chunk_id = getattr(chunk, "metadata", {}).get("chunk_id", str(i))
-
-            if not chunk_text or len(chunk_text.strip()) < 20:
-                continue  # 跳过过短的文本
-
-            try:
-                extraction = await extractor.extract(chunk_text)
-                for e in extraction.entities:
-                    e.source_chunk_id = chunk_id
-                for r in extraction.relationships:
-                    r.source_chunk_id = chunk_id
-                all_entities.extend(extraction.entities)
-                all_relationships.extend(extraction.relationships)
-                result.processed_chunks += 1
-            except Exception as e:
-                err_msg = f"Chunk {chunk_id} 抽取失败: {e}"
-                logger.error(err_msg)
-                result.errors.append(err_msg)
+    for batch_idx, batch in enumerate(graph_batches, start=1):
+        try:
+            logger.info(
+                "知识图谱抽取批次 %d/%d: %d 个 parent, %d tokens",
+                batch_idx, len(graph_batches), len(batch.chunks), _num_tokens(batch.text),
+            )
+            extraction = await extractor.extract(batch.text)
+            source_chunk_id = ",".join(batch.source_chunk_ids)
+            for e in extraction.entities:
+                e.source_chunk_id = source_chunk_id
+            for r in extraction.relationships:
+                r.source_chunk_id = source_chunk_id
+            all_entities.extend(extraction.entities)
+            all_relationships.extend(extraction.relationships)
+            result.processed_chunks += len(batch.chunks)
+        except Exception as e:
+            err_msg = f"Graph extraction batch {batch_idx} 抽取失败: {e}"
+            logger.error(err_msg)
+            result.errors.append(err_msg)
 
     result.entities_extracted = len(all_entities)
     result.relationships_extracted = len(all_relationships)
@@ -292,6 +408,16 @@ async def run_knowledge_graph_pipeline(
         logger.error(err_msg)
         result.errors.append(err_msg)
         return result
+
+    # 社区摘要：供全局/综合问题检索使用，失败不阻塞图入库
+    if enable_community_detection and generate_community_summaries and graph_result.communities:
+        try:
+            graph_result.communities = await summarizer.summarize_many(
+                graph_result.graph, graph_result.communities,
+            )
+        except Exception as e:
+            logger.warning("社区摘要生成失败: %s", e)
+
 
     # 存入 Milvus
     try:

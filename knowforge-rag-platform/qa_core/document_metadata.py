@@ -50,16 +50,31 @@ def is_reviewed_ocr_metadata(metadata: dict[str, Any]) -> bool:
     )
 
 
-def format_source_label(metadata: dict[str, Any]) -> str:
-    """生成前端和答案引用使用的来源标签。
+def _markdown_section_label(metadata: dict[str, Any]) -> str:
+    """返回 Markdown 标题切分后最具体的章节标签，没有标题时返回空字符串。
 
-    普通文档只展示文件名、标准问题或 source；表格资料额外展示 sheet 和行号。这样做的
-    目的不是美化文本，而是让答案中的 `[1]` 能追溯到具体文件、工作表和行，满足企业
-    RAG 场景对可解释性和可复核性的要求。
+    普通文件只有文件名时，来源仍然按文件名展示；一个 Markdown 文件内包含大量章节时，
+    优先展示 h3/h2/h1，避免多个证据都显示成同一个文件名。
 
     调用顺序：上游业务入口 -> format_source_label()。
     """
-    label = str(metadata.get("file_name") or metadata.get("standard_question") or metadata.get("source") or "unknown")
+    for key in ("h3", "h2", "h1"):
+        value = metadata.get(key)
+        if value:
+            return str(value).strip()
+    return ""
+
+
+def format_source_label(metadata: dict[str, Any]) -> str:
+    """生成前端和答案引用使用的来源标签。
+
+    普通文档只展示文件名、标准问题或 source；Markdown 文档优先展示其章节标题；表格资料
+    额外展示 sheet 和行号。这样做的目的不是美化文本，而是让答案中的 `[1]` 能追溯到具体
+    章节、文件、工作表和行，满足企业 RAG 场景对可解释性和可复核性的要求。
+
+    调用顺序：上游业务入口 -> format_source_label()。
+    """
+    label = str(_markdown_section_label(metadata) or metadata.get("file_name") or metadata.get("standard_question") or metadata.get("source") or "unknown")
     if is_reviewed_ocr_metadata(metadata):
         confidence = metadata.get("ocr_confidence")
         suffix = " / OCR 已复核"

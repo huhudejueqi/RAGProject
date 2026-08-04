@@ -614,6 +614,32 @@
   background: var(--primary-light);
 }
 
+.answer-graph-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: var(--space-3);
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  text-decoration: none;
+  transition: all var(--transition-fast);
+}
+
+.answer-graph-link:hover {
+  color: var(--primary);
+  border-color: var(--primary);
+  background: var(--primary-light);
+}
+
+.answer-graph-link i {
+  font-size: 13px;
+}
+
 .feedback-icon {
   display: inline-flex;
   align-items: center;

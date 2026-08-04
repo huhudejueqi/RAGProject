@@ -119,6 +119,7 @@ class Settings(BaseSettings):
     api_rate_limit_per_minute: int = Field(default=120, validation_alias="API_RATE_LIMIT_PER_MINUTE")
     v2_workbench_read_only: bool = Field(default=False, validation_alias="V2_WORKBENCH_READ_ONLY")
     v2_cost_budget_usd: float = Field(default=1.0, validation_alias="V2_COST_BUDGET_USD")
+    knowledge_graph_enabled: bool = Field(default=True, validation_alias="KNOWLEDGE_GRAPH_ENABLED")
 
     # 检索参数由 retrieval_strategy 动态组合使用
     # faq_top_k/doc_top_k：初次召回的候选数量，足够大才能让 reranker 从充足池中选优；

@@ -41,3 +41,4 @@ markdown==3.7
 pymdown-extensions==10.14
 pygments==2.19
 mkdocs-material==9.7.6
+tiktoken==0.13.0

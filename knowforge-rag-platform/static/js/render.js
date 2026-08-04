@@ -277,6 +277,16 @@ function renderAnswerSection(section) {
   `;
 }
 
+function renderGraphLink(query) {
+  const link = document.createElement('a');
+  link.className = 'answer-graph-link';
+  link.href = `/graph?q=${encodeURIComponent(query)}`;
+  link.target = '_blank';
+  link.rel = 'noopener noreferrer';
+  link.innerHTML = '<i class="fas fa-share-nodes"></i><span>知识图谱</span>';
+  return link;
+}
+
 function renderSources(sources) {
   const wrapper = document.createElement('div');
   wrapper.className = 'answer-sources';

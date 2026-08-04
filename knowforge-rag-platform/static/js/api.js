@@ -70,6 +70,7 @@ function streamAnswer(query, contentElement) {
         state.lastStreamStatus = '回答完成';
         state.lastDiagnostics = buildDiagnosticsSnapshot(data, sources);
         contentElement.innerHTML = renderAnswerContent(answer);
+        contentElement.appendChild(renderGraphLink(query));
         if (sources.length) {
           contentElement.appendChild(renderSources(sources));
         }

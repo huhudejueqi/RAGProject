@@ -1,0 +1,23 @@
+scenario_id = "medical_assistant"
+display_name = "医疗知识助手"
+industry = "医疗健康"
+description = "面向医院就诊、常见疾病和常用药品的医疗知识问答场景。"
+assistant_name = "医疗知识助手"
+business_domain = "医院就诊指引、疾病百科、治疗方案和常用药品信息"
+support_contact = "医疗知识库管理员"
+faq_collection = "medical_assistant_faq_hybrid_v1"
+doc_collection = "medical_assistant_doc_hybrid_v1"
+valid_sources = ["hospital", "disease", "drug"]
+sample_questions = ["百日咳有哪些症状？", "肺炎怎么治疗？", "初诊患者如何挂号？", "高血压患者常用哪些药物？"]
+resume_project_name = "多业务医疗知识智能问答平台"
+resume_keywords = ["医疗问答", "疾病百科", "医院FAQ", "药品适应症", "多版本知识库", "RAG"]
+
+[source_labels]
+hospital = "医院服务"
+disease = "疾病百科"
+drug = "药品资料"
+
+[source_patterns]
+hospital = "挂号|预约|急诊|住院|医保|门诊|科室|复诊|缴费|检查|取药|就医|医院|导诊|叫号|住院手续|出院|专家"
+disease = "症状|治疗|病因|检查|预防|用药|疾病|康复|病程|预后|感染|发烧|发热|咳嗽|腹泻|高血压|糖尿病|肺炎|感冒|失眠|头痛"
+drug = "药物|药品|用药|剂量|不良反应|适应症|禁忌|服药|药片|胶囊|注射液|处方|副作用"

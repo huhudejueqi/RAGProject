@@ -2,12 +2,15 @@
 
 使用 GraphRAG 本地搜索（local_search）作为知识图谱的主检索入口，
 替代原有的简单字符串匹配。当本地搜索无结果时回退到简单搜索。
+无实体命中时回退到社区级全局搜索（global_search）。
 """
 
 from __future__ import annotations
 
 from qa_core.config.logging_config import get_logger
+from qa_core.config.settings import get_settings
 from qa_core.knowledge_graph.local_search import local_search
+from qa_core.knowledge_graph.community_search import global_search
 
 logger = get_logger(__name__)
 
@@ -30,9 +33,18 @@ def format_graph_context(query: str, max_entities: int = 8, max_relations: int =
     返回：
         格式化的知识图谱上下文（无匹配时返回空字符串）
     """
+
+    if not get_settings().knowledge_graph_enabled:
+        return ""
+
     kg_ctx = local_search(query, max_entities=max_entities, max_relations=max_relations, max_hops=2)
     if kg_ctx:
         logger.info("format_graph_context: using local_search for query=%s", query)
+        return kg_ctx
+
+    kg_ctx = global_search(query, max_communities=3)
+    if kg_ctx:
+        logger.info("format_graph_context: using global_search for query=%s", query)
     else:
-        logger.debug("format_graph_context: local_search returned empty for query=%s", query)
+        logger.debug("format_graph_context: local and global search empty for query=%s", query)
     return kg_ctx

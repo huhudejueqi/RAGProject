@@ -10,6 +10,7 @@
   4. pipeline.py         — 与现有索引管线的集成入口
   5. local_search.py     — GraphRAG 本地搜索（基于图遍历）
   6. retrieval_integration.py — 与 RAG 管线的集成
+  7. community_search.py — 社区摘要生成与社区级全局搜索
 """
 
 from qa_core.knowledge_graph.extractor import GraphExtractor
@@ -20,6 +21,7 @@ from qa_core.knowledge_graph.pipeline import (
     KGIngestResult,
 )
 from qa_core.knowledge_graph.local_search import local_search
+from qa_core.knowledge_graph.community_search import global_search
 
 __all__ = [
     "GraphExtractor",
@@ -28,4 +30,5 @@ __all__ = [
     "run_knowledge_graph_pipeline",
     "KGIngestResult",
     "local_search",
+    "global_search",
 ]

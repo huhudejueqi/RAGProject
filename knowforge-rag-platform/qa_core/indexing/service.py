@@ -505,8 +505,8 @@ def ingest_directory(
         stats.skipped_files,
         active_kb_version,
     )
-    # ── 知识图谱构建（异步触发） ──
-    if _all_chunks:
+    # ── 知识图谱构建（可选触发，构建量大时可关闭避免阻塞普通 RAG 入库） ──
+    if _all_chunks and get_settings().knowledge_graph_enabled:
         try:
             import asyncio
             kg_result = asyncio.run(run_knowledge_graph_pipeline(

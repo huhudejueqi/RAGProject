@@ -54,7 +54,8 @@ let network = null;
 let allNodes = new vis.DataSet([]);
 let allEdges = new vis.DataSet([]);
 let filteredTypes = new Set();
-let currentQuery = '萧炎';
+let currentQuery = initialQuery();
+document.getElementById('searchInput').value = currentQuery;
 
 const TYPE_COLORS = {
   '人物':'#3498db','组织':'#e74c3c','地点':'#2ecc71',
@@ -71,6 +72,11 @@ function searchGraph() {
   loadGraph(q);
 }
 
+function initialQuery() {
+  const value = new URLSearchParams(window.location.search).get('q');
+  return (value || '').trim() || '萧炎';
+}
+
 async function loadGraph(query) {
   document.getElementById('stats').textContent = '查询中...';
   try {
@@ -80,6 +86,13 @@ async function loadGraph(query) {
 
     const nodes = data.nodes || [];
     const edges = data.edges || [];
+    if (!nodes.length) {
+      if (network) network.destroy();
+      network = null;
+      document.getElementById('stats').textContent = '未找到实体：' + query;
+      document.getElementById('legend').innerHTML = '<div class="legend-title">类型过滤</div><div style="color:#666;font-size:11px">无匹配实体</div>';
+      return;
+    }
 
     // ── 层级计算（按 degree 分 4 层） ──
     const degMap = {};
@@ -300,7 +313,7 @@ function resetView() {
 }
 
 // ── 默认加载 ──
-loadGraph('萧炎');
+loadGraph(currentQuery);
 </script>
 </body>
 </html>
