@@ -82,20 +82,27 @@ def build_parser() -> argparse.ArgumentParser:
     调用顺序：命令行入口 -> build_parser()。
     """
     parser = argparse.ArgumentParser(description="Rebuild one scenario into a complete knowledge base version.")
+    # 文档数据根目录：覆盖场景配置里的 data_root，用于批量加载业务文档。
     parser.add_argument(
         "--data-dir",
         default=None,
         help="Root data directory. Defaults to the selected scenario data_root.",
     )
+    # FAQ CSV 路径：覆盖场景配置里的 faq_csv_path。
     parser.add_argument(
         "--faq-csv",
         default=None,
         help="FAQ CSV path. Defaults to the selected scenario faq_csv_path.",
     )
+    # 场景 ID：确定要构建哪个业务知识库，默认取 ACTIVE_SCENARIO_ID。
     parser.add_argument("--scenario", default=None, help="Business scenario id. Defaults to ACTIVE_SCENARIO_ID.")
+    # 目标版本号：指定已有 kb_version；不新建时复用该版本。
     parser.add_argument("--kb-version", default=None, help="Explicit knowledge base version id.")
+    # 新建版本：创建 STAGED 新版本，不覆盖已有版本。
     parser.add_argument("--new-version", action="store_true", help="Create a new staged version before ingest.")
+    # 强制重建：忽略文件指纹，重新加载、切分和 embedding。
     parser.add_argument("--force", action="store_true", help="Rebuild files even when fingerprint is unchanged.")
+    # 增量基准版本：未变化文档复用基准版本 chunk，变化/删除文档按有效期失效。
     parser.add_argument(
         "--incremental-from",
         default=None,
@@ -104,8 +111,11 @@ def build_parser() -> argparse.ArgumentParser:
             "from the current active version, or pass an explicit kb_version. FAQ is still rebuilt."
         ),
     )
+    # 跳过 FAQ 入库：只处理文档，适合单独补文档。
     parser.add_argument("--skip-faq", action="store_true", help="Skip FAQ ingest.")
+    # 跳过文档入库：只处理 FAQ，适合单独补 FAQ。
     parser.add_argument("--skip-docs", action="store_true", help="Skip document ingest.")
+    # 重置 collection：drop 当前场景 FAQ/Doc Milvus collection，schema 变更时使用。
     parser.add_argument(
         "--reset-collections",
         action="store_true",
@@ -114,24 +124,42 @@ def build_parser() -> argparse.ArgumentParser:
             "Use this when schema changed, especially when migrating to BM25 BuiltInFunction hybrid search."
         ),
     )
+    # 跳过质量报告：仅允许 STAGED 构建，不能用于 --activate。
     parser.add_argument("--skip-quality-report", action="store_true", help="Skip ingestion quality report generation. Only allowed for staged builds.")
+    # 质量门禁：严格检查入库质量，超过阈值则失败；激活版本时自动开启。
     parser.add_argument("--quality-gate", action="store_true", help="Run strict ingestion quality gate. Activation always enables it.")
+    # 激活版本：质量门禁通过后切换 active 指针，线上检索立即使用新版本。
     parser.add_argument("--activate", action="store_true", help="Activate this version after successful ingest.")
+    # 版本描述：写入 kb_versions.description，用于发布审计。
     parser.add_argument("--description", default="", help="Human readable version description.")
+    # 租户 ID：写入 Milvus metadata，用于租户级数据隔离。
     parser.add_argument("--tenant-id", default=None, help="Tenant/org id written into metadata. Defaults to default.")
+    # 数据集 ID：写入 Milvus metadata，用于数据集级数据隔离。
     parser.add_argument("--dataset-id", default=None, help="Dataset id written into metadata. Defaults to default.")
+    # 可见级别：public/internal/private，控制谁能检索到这批数据。
     parser.add_argument("--visibility", default=None, help="Visibility written into metadata: public/internal/private.")
+    # 允许角色：可重复传入，写入 metadata 做角色级数据隔离。
     parser.add_argument("--allowed-role", action="append", default=None, help="Role allowed to retrieve this data. Can repeat.")
 
+    # 最大解析失败文件数：超过 0 个时质量门禁失败。
     parser.add_argument("--max-failed-files", type=int, default=0, help="Quality gate threshold.")
+    # 最大不支持文件数：文档类型没有对应 loader 时计入。
     parser.add_argument("--max-unsupported-files", type=int, default=0, help="Quality gate threshold.")
+    # 最大空文件数：文件加载后没有正文时计入。
     parser.add_argument("--max-empty-files", type=int, default=0, help="Quality gate threshold.")
+    # 最大低质量文档问题数：切分/元数据质量不足时计入。
     parser.add_argument("--max-low-quality-issues", type=int, default=0, help="Quality gate threshold.")
+    # 最大重复 chunk 数：同一内容被重复写入文档集合时计入。
     parser.add_argument("--max-duplicate-chunks", type=int, default=0, help="Quality gate threshold.")
+    # 最大空 FAQ 问题数：CSV 中问题缺失时计入。
     parser.add_argument("--max-empty-faq-questions", type=int, default=0, help="Quality gate threshold.")
+    # 最大空 FAQ 答案数：CSV 中答案缺失时计入。
     parser.add_argument("--max-empty-faq-answers", type=int, default=0, help="Quality gate threshold.")
+    # 最大重复 FAQ 问题数：同一标准问题重复出现时计入。
     parser.add_argument("--max-duplicate-faq-questions", type=int, default=0, help="Quality gate threshold.")
+    # 最大非法 FAQ source 数：FAQ 业务分类不在场景白名单时计入。
     parser.add_argument("--max-invalid-faq-sources", type=int, default=0, help="Quality gate threshold.")
+    # 最大 FAQ 与文档冲突数：FAQ 标准口径和文档内容冲突时计入。
     parser.add_argument("--max-faq-document-conflicts", type=int, default=0, help="Quality gate threshold.")
     return parser
 
